@@ -137,7 +137,9 @@ func HandlerForTransactional(reg prometheus.TransactionalGatherer, opts HandlerO
 				return
 			}
 		}
-		mfs, done, err := reg.Gather()
+
+		// 这里需要将 metadataVersion 和 req 中的 version 进行对比
+		mfs, done, err, metadataVersion := reg.Gather()
 		defer done()
 		if err != nil {
 			if opts.ErrorLog != nil {
@@ -180,8 +182,6 @@ func HandlerForTransactional(reg prometheus.TransactionalGatherer, opts HandlerO
 			w = gz
 		}
 
-		enc := expfmt.NewEncoder(w, contentType)
-
 		// handleError handles the error according to opts.ErrorHandling
 		// and returns true if we have to abort after the handling.
 		handleError := func(err error) bool {
@@ -206,15 +206,26 @@ func HandlerForTransactional(reg prometheus.TransactionalGatherer, opts HandlerO
 			return false
 		}
 
-		for _, mf := range mfs {
-			if handleError(enc.Encode(mf)) {
-				return
+		reqMetadataVersion := req.Header.Get("MetadataVersion")
+
+		if len(reqMetadataVersion) > 0 {
+			reqMetadataVersionUint, err := strconv.ParseUint(reqMetadataVersion, 10, 64)
+			handleError(err)
+			handleError(expfmt.GetCompressEncoder().Encode(mfs, metadataVersion, reqMetadataVersionUint, w))
+		} else {
+
+			enc := expfmt.NewEncoder(w, contentType)
+
+			for _, mf := range mfs {
+				if handleError(enc.Encode(mf)) {
+					return
+				}
 			}
-		}
-		if closer, ok := enc.(expfmt.Closer); ok {
-			// This in particular takes care of the final "# EOF\n" line for OpenMetrics.
-			if handleError(closer.Close()) {
-				return
+			if closer, ok := enc.(expfmt.Closer); ok {
+				// This in particular takes care of the final "# EOF\n" line for OpenMetrics.
+				if handleError(closer.Close()) {
+					return
+				}
 			}
 		}
 	})

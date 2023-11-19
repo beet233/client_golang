@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -157,7 +158,7 @@ type Gatherer interface {
 	// exposition in actual monitoring, it is almost always better to not
 	// expose an incomplete result and instead disregard the returned
 	// MetricFamily protobufs in case the returned error is non-nil.
-	Gather() ([]*dto.MetricFamily, error)
+	Gather() ([]*dto.MetricFamily, error, uint64)
 }
 
 // Register registers the provided Collector with the DefaultRegisterer.
@@ -187,10 +188,10 @@ func Unregister(c Collector) bool {
 }
 
 // GathererFunc turns a function into a Gatherer.
-type GathererFunc func() ([]*dto.MetricFamily, error)
+type GathererFunc func() ([]*dto.MetricFamily, error, uint64)
 
 // Gather implements Gatherer.
-func (gf GathererFunc) Gather() ([]*dto.MetricFamily, error) {
+func (gf GathererFunc) Gather() ([]*dto.MetricFamily, error, uint64) {
 	return gf()
 }
 
@@ -264,6 +265,7 @@ type Registry struct {
 	dimHashesByName       map[string]uint64
 	uncheckedCollectors   []Collector
 	pedanticChecksEnabled bool
+	metadataVersion       uint64
 }
 
 // Register implements Registerer.
@@ -351,6 +353,7 @@ func (r *Registry) Register(c Collector) error {
 	}
 
 	// Only after all tests have passed, actually register.
+	r.metadataVersion += 1
 	r.collectorsByID[collectorID] = c
 	for hash := range newDescIDs {
 		r.descIDs[hash] = struct{}{}
@@ -389,6 +392,8 @@ func (r *Registry) Unregister(c Collector) bool {
 	r.mtx.Lock()
 	defer r.mtx.Unlock()
 
+	r.metadataVersion += 1
+
 	delete(r.collectorsByID, collectorID)
 	for id := range descIDs {
 		delete(r.descIDs, id)
@@ -408,13 +413,13 @@ func (r *Registry) MustRegister(cs ...Collector) {
 }
 
 // Gather implements Gatherer.
-func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
+func (r *Registry) Gather() ([]*dto.MetricFamily, error, uint64) {
 	r.mtx.RLock()
 
 	if len(r.collectorsByID) == 0 && len(r.uncheckedCollectors) == 0 {
 		// Fast path.
 		r.mtx.RUnlock()
-		return nil, nil
+		return nil, nil, r.metadataVersion
 	}
 
 	var (
@@ -555,7 +560,7 @@ func (r *Registry) Gather() ([]*dto.MetricFamily, error) {
 			break
 		}
 	}
-	return internal.NormalizeMetricFamilies(metricFamiliesByName), errs.MaybeUnwrap()
+	return internal.NormalizeMetricFamilies(metricFamiliesByName), errs.MaybeUnwrap(), r.metadataVersion
 }
 
 // Describe implements Collector.
@@ -596,7 +601,7 @@ func WriteToTextfile(filename string, g Gatherer) error {
 	}
 	defer os.Remove(tmp.Name())
 
-	mfs, err := g.Gather()
+	mfs, err, _ := g.Gather()
 	if err != nil {
 		return err
 	}
@@ -742,15 +747,18 @@ func processMetric(
 type Gatherers []Gatherer
 
 // Gather implements Gatherer.
-func (gs Gatherers) Gather() ([]*dto.MetricFamily, error) {
+func (gs Gatherers) Gather() ([]*dto.MetricFamily, error, uint64) {
 	var (
 		metricFamiliesByName = map[string]*dto.MetricFamily{}
 		metricHashes         = map[uint64]struct{}{}
 		errs                 MultiError // The collected errors to return in the end.
 	)
 
+	var itemVersionList []uint64
+
 	for i, g := range gs {
-		mfs, err := g.Gather()
+		mfs, err, itemVersion := g.Gather()
+		itemVersionList = append(itemVersionList, itemVersion)
 		if err != nil {
 			multiErr := MultiError{}
 			if errors.As(err, &multiErr) {
@@ -798,7 +806,7 @@ func (gs Gatherers) Gather() ([]*dto.MetricFamily, error) {
 			}
 		}
 	}
-	return internal.NormalizeMetricFamilies(metricFamiliesByName), errs.MaybeUnwrap()
+	return internal.NormalizeMetricFamilies(metricFamiliesByName), errs.MaybeUnwrap(), calculateArrayHash(itemVersionList)
 }
 
 // checkSuffixCollisions checks for collisions with the “magic” suffixes the
@@ -1007,15 +1015,19 @@ func NewMultiTRegistry(tGatherers ...TransactionalGatherer) *MultiTRegistry {
 }
 
 // Gather implements TransactionalGatherer interface.
-func (r *MultiTRegistry) Gather() (mfs []*dto.MetricFamily, done func(), err error) {
+func (r *MultiTRegistry) Gather() (mfs []*dto.MetricFamily, done func(), err error, metadataVersion uint64) {
 	errs := MultiError{}
 
 	dFns := make([]func(), 0, len(r.tGatherers))
+
+	var itemVersionList []uint64
+
 	// TODO(bwplotka): Implement concurrency for those?
 	for _, g := range r.tGatherers {
 		// TODO(bwplotka): Check for duplicates?
-		m, d, err := g.Gather()
+		m, d, err, itemVersion := g.Gather()
 		errs.Append(err)
+		itemVersionList = append(itemVersionList, itemVersion)
 
 		mfs = append(mfs, m...)
 		dFns = append(dFns, d)
@@ -1029,7 +1041,28 @@ func (r *MultiTRegistry) Gather() (mfs []*dto.MetricFamily, done func(), err err
 		for _, d := range dFns {
 			d()
 		}
-	}, errs.MaybeUnwrap()
+	}, errs.MaybeUnwrap(), calculateArrayHash(itemVersionList)
+}
+
+func calculateArrayHash(array []uint64) uint64 {
+
+	// 创建 FNV 哈希对象
+	hasher := fnv.New64a()
+
+	// 将每个元素添加到哈希计算中
+	for _, value := range array {
+		// 将 uint64 转换为字节数组
+		bytes := make([]byte, 8)
+		for i := 0; i < 8; i++ {
+			bytes[i] = byte((value >> (8 * i)) & 0xFF)
+		}
+
+		// 添加到哈希计算中
+		hasher.Write(bytes)
+	}
+
+	// 得到最终的哈希值
+	return hasher.Sum64()
 }
 
 // TransactionalGatherer represents transactional gatherer that can be triggered to notify gatherer that memory
@@ -1056,7 +1089,7 @@ type TransactionalGatherer interface {
 	//
 	// Important: done is expected to be triggered (even if the error occurs!)
 	// once caller does not need returned slice of dto.MetricFamily.
-	Gather() (_ []*dto.MetricFamily, done func(), err error)
+	Gather() (_ []*dto.MetricFamily, done func(), err error, metadataVersion uint64)
 }
 
 // ToTransactionalGatherer transforms Gatherer to transactional one with noop as done function.
@@ -1069,7 +1102,7 @@ type noTransactionGatherer struct {
 }
 
 // Gather implements TransactionalGatherer interface.
-func (g *noTransactionGatherer) Gather() (_ []*dto.MetricFamily, done func(), err error) {
-	mfs, err := g.g.Gather()
-	return mfs, func() {}, err
+func (g *noTransactionGatherer) Gather() (_ []*dto.MetricFamily, done func(), err error, metadataVersion uint64) {
+	mfs, err, version := g.g.Gather()
+	return mfs, func() {}, err, version
 }
