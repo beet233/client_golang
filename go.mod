@@ -29,6 +29,6 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
 
-replace github.com/prometheus/common => github.com/beet233/common v0.44.0-compress-6
+replace github.com/prometheus/common => github.com/beet233/common v0.44.0-compress-7
 
 exclude github.com/prometheus/client_golang v1.12.1
